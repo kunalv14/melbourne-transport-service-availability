@@ -40,5 +40,3 @@ All 16 issues, with how each was detected and why the treatment is reasonable, a
 - Per-resident measures favour low-population areas and the CBD.
 - Sector colour reflects where an LGA's area lies, not where its services are.
 - Frequency data is incomplete for Macedon Ranges, Mitchell, Moorabool and Murrindindi, so their frequency and index values are understated.
-
-## Repository structure
