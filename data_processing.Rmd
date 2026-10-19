@@ -1,0 +1,493 @@
+---
+title: "Assessment 2 - Task 2A: Data Processing and Analysis"
+author: "Kunal Verma (22884100)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# 0. Purpose and project layout
+
+This document continues from Task 1. It (a) re-runs the preprocessing reproducibly with **relative paths**, (b) closes the gaps found when the Task 1 checks were extended (illogical values, missing values, linkage), and (c) builds the three final tables used by the Shiny app, one per task abstraction.
+
+```
+project/
+  02_task2A_processing.Rmd     <- this file
+  data/raw/                    <- ORIGINAL files exactly as supplied (nothing edited by hand)
+  data/processed/              <- created by this file; read by the Shiny app
+```
+
+Put the 7 CSVs, `LGA_2021_LGA_2024.csv`, `32350DS0003_2024.xlsx` and both `.geojson` files in `data/raw/`.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr); library(readxl); library(dplyr); library(tidyr)
+library(stringr); library(sf); library(knitr)
+
+raw_dir <- "data/raw"
+out_dir <- "data/processed"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# 1. Import and structural checks
+
+**Step.** Before importing, the number of fields on every line of each CSV is counted. A line with a different count from the header signals a structural problem such as an unintended comma inside a number. A file that imports without an error is not automatically correct.
+
+```{r structure}
+field_check <- function(f) {
+  n <- count.fields(file.path(raw_dir, f), sep = ",", quote = "\"", comment.char = "")
+  tibble(file = f,
+         data_rows = length(n) - 1,
+         header_fields = n[1],
+         lines_off_spec = sum(n != n[1]),
+         first_bad_line = if (any(n != n[1])) which(n != n[1])[1] else NA_integer_)
+}
+csvs <- c("LGA_2021_LGA_2024.csv", "lga_area.csv", "lga_details.csv", "lga_adjacents.csv",
+          "lga_sector.csv", "lga_stops_routes.csv", "routes_city_freq.csv")
+structure_check <- bind_rows(lapply(csvs, field_check))
+kable(structure_check, caption = "Field-count check on the raw CSV files")
+```
+
+Two files have one off-spec line each: `lga_area.csv` (Yarra Ranges, `1,611.9332`) and `lga_sector.csv` (Cardinia, `1,283`). Both are thousands separators that split one number into two fields.
+
+**Treatment.** The raw files are left untouched. The fix is applied in code (so it is reproducible and the manual step is documented), and the number of lines changed is checked to be exactly one per file.
+
+```{r repair}
+fix_thousands <- function(file, col_types) {
+  lines <- read_lines(file.path(raw_dir, file))
+  pat <- ",(\\d{1,3}),(\\d{3})(\\.\\d+)?(?=,|$)"
+  hit <- str_detect(lines, pat)
+  lines <- str_replace(lines, pat, ",\\1\\2\\3")
+  tf <- tempfile(fileext = ".csv"); write_lines(lines, tf)
+  list(data = read_csv(tf, col_types = col_types, show_col_types = FALSE),
+       lines_fixed = sum(hit), which = which(hit))
+}
+
+a <- fix_thousands("lga_area.csv",
+  cols(lga_code21 = "c", lga_name21 = "c", sqkm = "d", cbd_euclidean_km = "d"))
+s <- fix_thousands("lga_sector.csv",
+  cols(lga_code21 = "c", lga_name21 = "c", sector = "c", lga_sqkm = "d", lga_part_sqkm_pct = "d"))
+
+lga_area   <- a$data
+lga_sector <- s$data
+stopifnot(a$lines_fixed == 1, s$lines_fixed == 1,
+          ncol(lga_area) == 4, nrow(lga_area) == 36,
+          ncol(lga_sector) == 5, nrow(lga_sector) == 41)
+
+kable(tibble(file = c("lga_area.csv", "lga_sector.csv"),
+             lines_fixed = c(a$lines_fixed, s$lines_fixed),
+             rows_after = c(nrow(lga_area), nrow(lga_sector)),
+             cols_after = c(ncol(lga_area), ncol(lga_sector))),
+      caption = "After repair: expected 4 and 5 columns")
+```
+
+```{r import-rest}
+blank_to_na <- function(df) df %>% mutate(across(where(is.character), ~ na_if(str_trim(.x), "")))
+
+mapping <- read_csv(file.path(raw_dir, "LGA_2021_LGA_2024.csv"),
+                    col_types = cols(.default = "c"))
+lga_details <- read_csv(file.path(raw_dir, "lga_details.csv"),
+                        col_types = cols(lga_code21 = "c", lga_name21 = "c", .default = "d"))
+lga_adjacents <- read_csv(file.path(raw_dir, "lga_adjacents.csv"),
+                          col_types = cols(.default = "c")) %>% blank_to_na()
+stops_routes_raw <- read_csv(file.path(raw_dir, "lga_stops_routes.csv"),
+                             col_types = cols(.default = "c")) %>% blank_to_na()
+route_freq <- read_csv(file.path(raw_dir, "routes_city_freq.csv"),
+                       col_types = cols(vehicle = "c", route_number = "c", route_name = "c",
+                                        daily_freq = "d", weekday_freq = "d", weekend_freq = "d")) %>%
+  blank_to_na()
+
+lga_area_geo <- st_read(file.path(raw_dir, "lga_area.geojson"), quiet = TRUE) %>%
+  mutate(lga_code21 = as.character(lga_code21))
+stops_geo <- st_read(file.path(raw_dir, "stops.geojson"), quiet = TRUE)
+```
+
+Empty strings (`""`) were converted to `NA` so that "missing" is counted consistently. This is why Task 1 reported 2,959 missing values in the stop-route file (2,953 `route_number` + 6 `route_name`).
+
+# 2. ABS population (Table 3)
+
+**Issue found in Task 1.** The sheet was read with `skip = 5`, which makes the age-group row the header and leaves a units row (`no.`) as the first data row. The result was 23 character columns, so no number could be used. Table 3 also contains a national total row and footnotes.
+
+**Treatment.** Read without a header, set explicit names, keep only rows that have a numeric state code (this removes the units row, the national total and the footnotes), then convert to numeric.
+
+```{r population}
+pop_raw <- read_excel(file.path(raw_dir, "32350DS0003_2024.xlsx"),
+                      sheet = "Table 3", col_names = FALSE, col_types = "text")
+
+age_cols <- c("age_0_4","age_5_9","age_10_14","age_15_19","age_20_24","age_25_29",
+              "age_30_34","age_35_39","age_40_44","age_45_49","age_50_54","age_55_59",
+              "age_60_64","age_65_69","age_70_74","age_75_79","age_80_84","age_85_plus")
+
+aus_total <- as.numeric(pop_raw[[23]][which(pop_raw[[4]] %in% "Total Persons Australia")])
+
+pop <- pop_raw %>%
+  setNames(c("st_code", "st_name", "lga_code24", "lga_name24", age_cols, "total_persons")) %>%
+  filter(str_detect(st_code, "^[0-9]+$")) %>%
+  mutate(across(all_of(c(age_cols, "total_persons")), as.numeric))
+
+pop_checks <- tibble(
+  check = c("LGA rows kept", "Missing values", "Duplicate LGA codes",
+            "Rows where age groups do not sum to Total persons",
+            "Sum of LGAs minus the ABS national total row"),
+  result = c(nrow(pop), sum(is.na(pop)), sum(duplicated(pop$lga_code24)),
+             sum(rowSums(pop[age_cols]) != pop$total_persons),
+             sum(pop$total_persons) - aus_total))
+kable(pop_checks, caption = "ABS Table 3 validation (expect 547 / 0 / 0 / 0 / 0)")
+
+pop_vic <- pop %>% filter(st_name == "Victoria") %>% select(lga_code24, lga_name24, population = total_persons)
+kable(tibble(scope = c("Australia (all LGAs)", "Victoria"),
+             lgas = c(nrow(pop), nrow(pop_vic)),
+             population = c(sum(pop$total_persons), sum(pop_vic$population))),
+      format.args = list(big.mark = ","), caption = "Population before and after filtering to Victoria")
+```
+
+# 3. LGA versions: linking 2021 codes to 2024 population
+
+The transport and boundary files use ASGS **2021** codes and the population uses **2024** codes. Joining directly by code is tested first to show what would go wrong, then the crosswalk is used.
+
+```{r crosswalk}
+naive <- lga_area %>% left_join(pop_vic, by = c("lga_code21" = "lga_code24"))
+cat("Direct join on code: LGAs with no population =", sum(is.na(naive$population)), "->",
+    paste(naive$lga_name21[is.na(naive$population)], collapse = ", "), "\n")
+
+lga_ref <- lga_area %>%
+  left_join(mapping, by = c("lga_code21" = "LGA_CODE_2021")) %>%
+  left_join(pop_vic, by = c("LGA_CODE_2024" = "lga_code24"))
+
+kable(lga_ref %>% filter(lga_code21 != LGA_CODE_2024) %>%
+        select(lga_name21, lga_code21, LGA_NAME_2024, LGA_CODE_2024, population),
+      caption = "LGAs whose code or name changed between 2021 and 2024")
+
+stopifnot(!anyNA(lga_ref$LGA_CODE_2024), !anyNA(lga_ref$population), nrow(lga_ref) == nrow(lga_area))
+```
+
+A direct join silently loses **Moreland** (2021 code 25250), which became **Merri-bek** (2024 code 24700). The crosswalk matches all 36 LGAs and no rows are lost or duplicated. Joining by name would also fail for this LGA, which is why codes plus the mapping table are used.
+
+# 4. Scope: which records belong in the analysis
+
+```{r scope}
+scope_tbl <- tibble(
+  file = c("lga_stops_routes.csv", "lga_stops_routes.csv", "lga_stops_routes.csv", "lga_sector.csv"),
+  step = c("Rows as supplied (all Victoria)",
+           "Rows in the 36 assessment LGAs",
+           "After removing exact duplicate rows",
+           "LGAs in the 36-LGA list but missing from this file"),
+  value = c(nrow(stops_routes_raw),
+            sum(stops_routes_raw$lga_code21 %in% lga_area$lga_code21),
+            nrow(distinct(filter(stops_routes_raw, lga_code21 %in% lga_area$lga_code21))),
+            length(setdiff(lga_area$lga_code21, lga_sector$lga_code21))))
+kable(scope_tbl, format.args = list(big.mark = ","))
+
+stops_routes <- stops_routes_raw %>%
+  filter(lga_code21 %in% lga_area$lga_code21) %>%
+  distinct()
+```
+
+* The stop-route file covers **80** Victorian LGAs, but the assessment list (`lga_area.csv`) has **36**. The other 44 regional LGAs (9,460 rows, e.g. Greater Geelong, Ballarat) are out of scope and removed.
+* **4 exact duplicate rows** (all Moonee Valley, stops 19270 and 19276) are removed. They are repeats of the same stop-route pair, not different services.
+* Remaining repeated `stop_id` values are legitimate: one stop serves several routes. Each indicator therefore states whether it counts records, unique stops or unique routes.
+
+## Decision: Unincorporated Vic
+
+```{r uv}
+uv <- lga_ref %>% filter(lga_name21 == "Unincorporated Vic") %>%
+  transmute(lga_name21, sqkm, population,
+            stop_route_records = sum(stops_routes$lga_code21 == lga_code21),
+            unique_routes = n_distinct(stops_routes$route_name[stops_routes$lga_code21 == lga_code21]))
+kable(uv, caption = "Unincorporated Vic profile")
+```
+
+It is a valid geographic record but has 0.18 km², 964 residents and 2 stop records. Per-km² and per-resident ratios would be driven by tiny denominators and would not be comparable with normal LGAs. **Decision: excluded from all indicators, maps and rankings (35 LGAs analysed), but kept in the raw-data tab and documented.**
+
+```{r study}
+study_lga <- lga_ref %>% filter(lga_name21 != "Unincorporated Vic")
+stopifnot(nrow(study_lga) == 35)
+sr <- stops_routes %>% filter(lga_code21 %in% study_lga$lga_code21)
+```
+
+# 5. Further quality checks (illogical values, missing values, linkage)
+
+## 5.1 Frequency file (`routes_city_freq.csv`)
+
+```{r freq-checks}
+route_freq <- route_freq %>%
+  mutate(route_key = paste(vehicle, coalesce(route_number, ""), coalesce(route_name, ""), sep = "|"))
+
+freq_checks <- tibble(
+  check = c("Routes (rows)",
+            "Missing route_number (legitimate, e.g. V/Line coaches)",
+            "Routes where daily_freq is outside weekday/weekend range (+-1)",
+            "daily_freq <= 0",
+            "Duplicate vehicle + route_number (non-missing)",
+            "Duplicate vehicle + route_number + route_name"),
+  result = c(nrow(route_freq),
+             sum(is.na(route_freq$route_number)),
+             sum(route_freq$daily_freq < pmin(route_freq$weekday_freq, route_freq$weekend_freq) - 1 |
+                 route_freq$daily_freq > pmax(route_freq$weekday_freq, route_freq$weekend_freq) + 1),
+             sum(route_freq$daily_freq <= 0),
+             sum(duplicated(route_freq[!is.na(route_freq$route_number), c("vehicle", "route_number")])),
+             sum(duplicated(route_freq$route_key))))
+kable(freq_checks)
+stopifnot(!anyDuplicated(route_freq$route_key))
+```
+
+* Frequencies are plausible (all positive; `daily_freq` lies between the weekday and weekend values).
+* **Missing `route_number` is not an error** (the metadata says so), so rows are kept.
+* `vehicle + route_number` is **not unique** (5 pairs repeat, e.g. bus 675, 843, 900 and the Pakenham train line, because each direction or variant has its own name). Joining on it would duplicate rows and inflate frequencies. The **three-part key `vehicle | route_number | route_name`** is unique (0 duplicates) and is used everywhere. Missing parts become an empty string so the key is always defined.
+
+## 5.2 Linking stop-route records to frequencies
+
+```{r link}
+sr <- sr %>% mutate(route_key = paste(vehicle, coalesce(route_number, ""), coalesce(route_name, ""), sep = "|"))
+
+keys_all <- stops_routes %>%
+  mutate(route_key = paste(vehicle, coalesce(route_number, ""), coalesce(route_name, ""), sep = "|")) %>%
+  distinct(vehicle, route_number, route_name, route_key)
+
+unmatched <- keys_all %>% anti_join(route_freq, by = "route_key")
+kable(tibble(
+  measure = c("Distinct routes in the 36 LGAs", "...with a frequency record", "...without a frequency record",
+              "Routes in frequency file not found in stop-route file"),
+  value = c(nrow(keys_all), nrow(keys_all) - nrow(unmatched), nrow(unmatched),
+            nrow(anti_join(route_freq, keys_all, by = "route_key")))),
+  caption = "Route linkage (expect 498 / 453 / 45 / 0)")
+kable(head(unmatched %>% select(vehicle, route_number, route_name), 12),
+      caption = "Examples of routes with no frequency record")
+```
+
+**Why it matters.** 45 routes (mostly regional coaches and local bus routes such as 941, 951, 959, 978-982) have no frequency record. The file is a "city" frequency file, so they are simply absent.
+
+**Treatment (assumption stated).** Missing frequency is **never set to zero**. Unmatched routes are still counted in route counts, but are left out of frequency totals and averages. The share of an LGA's routes that have a frequency (`freq_match_rate`) is carried into the final tables and shown in the app, because LGAs with low match rates have understated frequency totals.
+
+## 5.3 Contextual tables (not used in the three indicators, but checked)
+
+```{r context-checks}
+adj_missing <- lga_adjacents %>% filter(is.na(lga_code21))
+kable(adj_missing, caption = "lga_adjacents.csv: rows with a missing primary LGA code")
+
+lga_adjacents <- lga_adjacents %>%
+  left_join(lga_area %>% select(lga_name21, code_from_area = lga_code21), by = "lga_name21") %>%
+  mutate(lga_code21 = coalesce(lga_code21, code_from_area)) %>% select(-code_from_area)
+stopifnot(!anyNA(lga_adjacents$lga_code21))
+
+kable(lga_details %>% filter(if_any(education:public, is.na)), caption = "lga_details.csv: missing counts")
+kable(lga_details %>% arrange(desc(higher_education)) %>% head(3), caption = "Highest higher_education counts")
+lga_details <- lga_details %>% mutate(higher_education = if_else(higher_education > 50, NA_real_, higher_education))
+
+sector_check <- lga_sector %>% group_by(lga_code21, lga_name21) %>%
+  summarise(total = sum(lga_part_sqkm_pct), parts = n(), .groups = "drop")
+kable(tibble(check = c("Range of lga_part_sqkm_pct", "LGAs whose shares do not sum to 1", "LGAs split across sectors"),
+             result = c(paste(range(lga_sector$lga_part_sqkm_pct), collapse = " to "),
+                        sum(abs(sector_check$total - 1) > 0.01), sum(sector_check$parts > 1))))
+```
+
+* **Wyndham** has a missing code in 3 adjacency rows. It is recovered from `lga_area.csv` by exact name (one Wyndham, code 27260), not guessed.
+* **Melbourne** has all four facility counts missing (kept as `NA`, not zero). **Darebin** has `higher_education = 100`, over 12 times the next highest value (8), so it is treated as suspicious and set to `NA`. The true value cannot be recovered. These facility counts are context only and are not used in the indicators.
+* `lga_part_sqkm_pct` is a **proportion from 0 to 1**, not a percentage despite its name. Shares sum to 1 for every LGA. Five LGAs span two sectors.
+* `stops.geojson` has 28,977 points but only 28,546 distinct `stop_id` values and 353 missing `mb_code_2021`. All 21,385 stop IDs used in the CSV are present. Indicators are counted from the CSV; the point file is only used for optional map points, after de-duplicating by `stop_id`.
+
+# 6. Task abstraction 1 (raw values): scale of service
+
+**Action-target.** *Explore* the spatial distribution of public transport service **volume** (unique stops, unique routes, total daily frequency) across Greater Melbourne LGAs.
+
+**Tables and variables.** `lga_stops_routes` (`lga_code21`, `stop_id`, `vehicle`, `route_number`, `route_name`), `routes_city_freq` (`daily_freq`), `lga_area.geojson` (geometry).
+
+| Indicator | Rule |
+|---|---|
+| Stop-route records | `n()` rows per LGA (shown for transparency only) |
+| **Unique stops** | `n_distinct(stop_id)` per LGA |
+| **Unique routes** | number of distinct `route_key` per LGA |
+| **Total daily frequency** | `sum(daily_freq)` over **distinct LGA-route pairs** that have a frequency record |
+
+Frequency is summed only after removing repeated LGA-route pairs. Otherwise a route with 40 stops in an LGA would be counted 40 times. A route that crosses several LGAs contributes its full route-level `daily_freq` to each LGA it serves (assumption: frequency is a route property, not LGA-specific).
+
+```{r ta1}
+stop_counts <- sr %>%
+  group_by(lga_code21) %>%
+  summarise(stop_route_records = n(),
+            unique_stops = n_distinct(stop_id),
+            vehicle_types = n_distinct(vehicle),
+            vehicle_mix = paste(sort(unique(vehicle)), collapse = " + "),
+            .groups = "drop")
+
+lga_route <- sr %>%
+  distinct(lga_code21, route_key) %>%
+  left_join(route_freq %>% select(route_key, daily_freq), by = "route_key")
+
+stopifnot(!anyDuplicated(lga_route[c("lga_code21", "route_key")]))
+
+route_counts <- lga_route %>%
+  group_by(lga_code21) %>%
+  summarise(unique_routes = n(),
+            routes_with_freq = sum(!is.na(daily_freq)),
+            total_daily_freq = sum(daily_freq, na.rm = TRUE),
+            avg_daily_freq = mean(daily_freq, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(freq_match_rate = routes_with_freq / unique_routes)
+
+ta1 <- study_lga %>%
+  select(lga_code21, lga_name21) %>%
+  left_join(stop_counts, by = "lga_code21") %>%
+  left_join(route_counts, by = "lga_code21") %>%
+  select(lga_code21, lga_name21, stop_route_records, unique_stops, unique_routes,
+         total_daily_freq, routes_with_freq, freq_match_rate)
+
+stopifnot(nrow(ta1) == 35, !anyDuplicated(ta1$lga_code21), !anyNA(ta1$unique_stops),
+          all(ta1$unique_stops <= ta1$stop_route_records))
+kable(ta1 %>% arrange(desc(unique_stops)) %>% head(8), digits = 2, caption = "TA1 final table (top 8 by unique stops)")
+```
+
+# 7. Task abstraction 2 (processed values): service intensity
+
+**Action-target.** *Compare* service intensity across LGAs using derived indicators (density and average frequency), grouped by dominant metropolitan sector.
+
+**Tables and variables.** TA1 table + `lga_area` (`sqkm`) + `lga_sector` (`sector`, `lga_part_sqkm_pct`).
+
+| Indicator | Formula |
+|---|---|
+| **Stops per km²** | `unique_stops / sqkm` |
+| Routes per km² | `unique_routes / sqkm` |
+| **Average daily frequency** | `mean(daily_freq)` over the LGA's distinct routes **that have a frequency record** (average per route, not per stop) |
+| **Dominant sector** | sector with the largest `lga_part_sqkm_pct`. A tie goes to the more central sector (Inner, then Middle, then Outer). |
+| Sector mix label | text such as "Inner 50% / Middle 50%", for display only |
+
+The dominant sector describes **area overlap only**. Service values are never split by sector share.
+
+```{r ta2}
+sector_levels <- c("Inner Melbourne", "Middle Melbourne", "Outer Melbourne")
+
+dominant <- lga_sector %>%
+  mutate(sector_order = match(sector, sector_levels)) %>%
+  arrange(lga_code21, desc(lga_part_sqkm_pct), sector_order) %>%
+  group_by(lga_code21) %>% slice(1) %>% ungroup() %>%
+  select(lga_code21, dominant_sector = sector)
+
+sector_mix <- lga_sector %>%
+  mutate(sector_order = match(sector, sector_levels)) %>%
+  arrange(lga_code21, sector_order) %>%
+  group_by(lga_code21) %>%
+  summarise(sector_mix = paste0(str_remove(sector, " Melbourne"), " ",
+                                round(lga_part_sqkm_pct * 100), "%", collapse = " / "),
+            .groups = "drop")
+
+ta2 <- ta1 %>%
+  left_join(study_lga %>% select(lga_code21, sqkm, cbd_euclidean_km), by = "lga_code21") %>%
+  left_join(route_counts %>% select(lga_code21, avg_daily_freq), by = "lga_code21") %>%
+  left_join(stop_counts %>% select(lga_code21, vehicle_types, vehicle_mix), by = "lga_code21") %>%
+  left_join(dominant, by = "lga_code21") %>%
+  left_join(sector_mix, by = "lga_code21") %>%
+  mutate(stops_per_km2 = unique_stops / sqkm,
+         routes_per_km2 = unique_routes / sqkm,
+         dominant_sector = factor(dominant_sector, levels = sector_levels)) %>%
+  select(lga_code21, lga_name21, sqkm, cbd_euclidean_km, unique_stops, unique_routes,
+         stops_per_km2, routes_per_km2, avg_daily_freq, vehicle_types, vehicle_mix,
+         dominant_sector, sector_mix, freq_match_rate)
+
+stopifnot(nrow(ta2) == 35, !anyNA(ta2$dominant_sector), !anyNA(ta2$stops_per_km2),
+          all(is.finite(ta2$avg_daily_freq)))
+kable(ta2 %>% count(dominant_sector), caption = "LGAs per dominant sector")
+kable(ta2 %>% arrange(desc(stops_per_km2)) %>% select(lga_name21, stops_per_km2, avg_daily_freq, dominant_sector) %>% head(8),
+      digits = 2, caption = "TA2 final table (top 8 by stop density)")
+```
+
+# 8. Task abstraction 3 (normalised / indexed): fair comparison by population
+
+**Action-target.** *Rank* LGAs by a composite **Transport Service Availability Index (0-100)** built from population-normalised indicators.
+
+**Tables and variables.** TA1 table + population (ABS 2024 Table 3 via the 2021 to 2024 crosswalk).
+
+| Step | Formula |
+|---|---|
+| Per-capita indicators | `stops_per_1000 = unique_stops / population * 1000`, `routes_per_1000 = unique_routes / population * 1000`, `freq_per_1000 = total_daily_freq / population * 1000` |
+| Min-max scaling (0-100) | `x' = (x - min(x)) / (max(x) - min(x)) * 100`, computed across the 35 LGAs |
+| **Index** | **Equal weights** of 1/3 each: `index = (stops' + routes' + freq') / 3` |
+| Rank | 1 = highest index (ties share the lower rank number) |
+
+**Why equal weights.** No evidence in the data says one dimension (coverage, route variety or frequency) matters more, so equal weights are the most transparent default. All three components are "higher = more service", so no direction reversal is needed. The index is **relative** (0 = lowest of these 35 LGAs, 100 = highest), not an absolute standard of good service.
+
+```{r ta3}
+minmax100 <- function(x) (x - min(x)) / (max(x) - min(x)) * 100
+w <- c(stops = 1/3, routes = 1/3, freq = 1/3)
+stopifnot(abs(sum(w) - 1) < 1e-9)
+
+ta3 <- ta1 %>%
+  left_join(study_lga %>% select(lga_code21, LGA_CODE_2024, LGA_NAME_2024, population), by = "lga_code21") %>%
+  mutate(stops_per_1000  = unique_stops / population * 1000,
+         routes_per_1000 = unique_routes / population * 1000,
+         freq_per_1000   = total_daily_freq / population * 1000,
+         stops_scaled    = minmax100(stops_per_1000),
+         routes_scaled   = minmax100(routes_per_1000),
+         freq_scaled     = minmax100(freq_per_1000),
+         service_index   = w[["stops"]] * stops_scaled + w[["routes"]] * routes_scaled + w[["freq"]] * freq_scaled,
+         index_rank      = rank(-service_index, ties.method = "min")) %>%
+  arrange(index_rank)
+
+stopifnot(nrow(ta3) == 35, !anyNA(ta3$population), !anyNA(ta3$service_index),
+          all(ta3$service_index >= 0 & ta3$service_index <= 100),
+          min(ta3$stops_scaled) == 0, max(ta3$stops_scaled) == 100)
+
+kable(ta3 %>% select(index_rank, lga_name21, population, stops_per_1000, routes_per_1000,
+                     freq_per_1000, service_index, freq_match_rate),
+      digits = 2, format.args = list(big.mark = ","), caption = "TA3 final table (full ranking)")
+
+cat("Population of the 35 analysed LGAs:", format(sum(ta3$population), big.mark = ","),
+    "| 36 LGAs incl. Unincorporated Vic:", format(sum(study_lga$population) + uv$population, big.mark = ","), "\n")
+```
+
+# 9. Save analysis-ready outputs for the Shiny app
+
+```{r save}
+lga_indicators <- ta1 %>%
+  left_join(ta2 %>% select(lga_code21, sqkm, cbd_euclidean_km, stops_per_km2, routes_per_km2,
+                           avg_daily_freq, vehicle_types, vehicle_mix, dominant_sector, sector_mix),
+            by = "lga_code21") %>%
+  left_join(ta3 %>% select(lga_code21, population, stops_per_1000, routes_per_1000, freq_per_1000,
+                           stops_scaled, routes_scaled, freq_scaled, service_index, index_rank),
+            by = "lga_code21")
+
+stopifnot(nrow(lga_indicators) == 35, !anyDuplicated(lga_indicators$lga_code21))
+
+lga_map <- lga_area_geo %>%
+  filter(lga_code21 %in% lga_indicators$lga_code21) %>%
+  select(lga_code21) %>%
+  st_make_valid() %>%
+  left_join(lga_indicators, by = "lga_code21")
+stopifnot(nrow(lga_map) == 35, !anyNA(lga_map$unique_stops))
+
+saveRDS(ta1, file.path(out_dir, "ta1_raw_values.rds"))
+saveRDS(ta2, file.path(out_dir, "ta2_processed_values.rds"))
+saveRDS(ta3, file.path(out_dir, "ta3_normalised_index.rds"))
+saveRDS(lga_indicators, file.path(out_dir, "lga_indicators.rds"))
+saveRDS(lga_map, file.path(out_dir, "lga_map.rds"))
+write_csv(lga_indicators, file.path(out_dir, "lga_indicators.csv"))
+```
+
+# 10. Issue log (feeds Tab 4 of the app)
+
+```{r issue-log}
+issue_log <- tribble(
+  ~id, ~file, ~issue, ~detected_by, ~why_it_matters, ~treatment, ~why_reasonable,
+  1, "lga_area.csv", "Thousands separator splits Yarra Ranges area (1,611.9332) into two fields", "Field-count check: 1 line with 5 fields instead of 4", "Shifts cbd_euclidean_km into the wrong column and the largest LGA gets the wrong area", "Comma removed in code; raw file untouched; 36 x 4 verified", "Original intended value preserved",
+  2, "lga_sector.csv", "Thousands separator in Cardinia area (1,283)", "Field-count check: 1 line with 6 fields instead of 5", "Shifts lga_part_sqkm_pct into the wrong column", "Comma removed in code; 41 x 5 verified", "Original intended value preserved",
+  3, "ABS Table 3", "Header and footer layout: imported as 23 character columns with a units row as data", "Column type summary showed 0 numeric columns", "No population arithmetic is possible", "Explicit column names; keep rows with a numeric state code; convert to numeric", "Age groups sum to Total persons for every row and the sum matches the ABS national total",
+  4, "ABS vs transport files", "Moreland (25250, 2021) is Merri-bek (24700, 2024)", "Direct join on code left 1 LGA without population", "Moreland would silently drop out of per-capita analysis", "Joined through LGA_2021_LGA_2024.csv", "All 36 LGAs matched; no rows lost or duplicated",
+  5, "ABS Table 3", "National scope: 547 LGAs", "Row count vs the 36-LGA study list", "Totals would not describe Greater Melbourne", "Filtered to Victoria then to the study LGAs via the crosswalk", "Population reconciled before and after filtering",
+  6, "lga_stops_routes.csv", "Covers 80 Victorian LGAs; only 36 are in scope", "Distinct LGA codes vs lga_area.csv", "Regional LGAs would inflate totals and break rankings", "Removed 9,460 rows from 44 regional LGAs", "Question is about Greater Melbourne",
+  7, "lga_stops_routes.csv", "4 exact duplicate rows (Moonee Valley)", "duplicated() on all columns", "Overstates record counts", "Removed with distinct()", "Identical repeats, not separate services",
+  8, "lga_stops_routes.csv", "Missing route_number (2,953 rows overall; 595 in scope) and 6 missing route_name (City Circle)", "Missing-value count by column", "Breaks a route key built on route_number alone", "Kept; key = vehicle + route_number + route_name with blanks as empty text", "Metadata says missing numbers are not invalid",
+  9, "routes_city_freq.csv", "vehicle + route_number is not unique (5 repeats); route_number missing for 39 routes", "Duplicate check on candidate keys", "A 2-part join would duplicate rows and inflate frequency", "Three-part key (0 duplicates)", "Recommended in the metadata; verified unique",
+  10, "Stop-route vs frequency", "45 of 498 routes have no frequency record (mostly regional coaches and local bus routes)", "anti_join of route keys", "Frequency totals are understated where match rates are low (e.g. Murrindindi 50%)", "Not set to zero; excluded from frequency totals; counted in route counts; freq_match_rate reported", "Metadata warns against treating missing frequency as zero",
+  11, "Frequency indicators", "Route frequency is route-level, but routes cross LGAs", "Reasoning from the data structure", "Summing per stop-route row would multiply frequency by the number of stops", "Deduplicate to distinct LGA-route pairs before summing", "Each LGA gets the route frequency once",
+  12, "Unincorporated Vic", "0.18 km2, 964 residents, 2 stop records", "Profile of the record", "Ratios driven by tiny denominators", "Excluded from indicators, maps and rankings; kept in raw data tab", "Valid record but not comparable",
+  13, "lga_adjacents.csv", "Wyndham primary code missing in 3 rows", "Missing-value check", "Neighbour links incomplete", "Recovered from lga_area.csv by exact name (27260)", "Only one Wyndham exists; code recovered, not guessed",
+  14, "lga_details.csv", "Melbourne all counts missing; Darebin higher_education = 100", "Missing check and outlier inspection (next highest 8)", "Misleading context if used", "Melbourne kept as NA; Darebin value set to NA", "True value cannot be recovered; not used in indicators",
+  15, "lga_sector.csv", "lga_part_sqkm_pct is a 0-1 proportion; Stonnington is split 50/50", "Range check and shares per LGA", "Misreading as a percentage; ambiguous dominant sector", "Treated as proportion; tie goes to the more central sector", "Rule stated and applied consistently",
+  16, "stops.geojson", "431 repeated stop_id values; 353 missing mb_code_2021", "duplicated() on stop_id", "Double-plotted points", "Indicators counted from the CSV; points de-duplicated if mapped", "All 21,385 CSV stop IDs exist in the point file"
+)
+write_csv(issue_log, file.path(out_dir, "issue_log.csv"))
+kable(issue_log %>% select(id, file, issue, treatment))
+```
+
+# 11. Refinements since Task 1
+
+In response to feedback, the Task 1 plan was made reproducible without changing the three analytical ideas: formal action-target wording, explicit formulas, a unique LGA-route key, route frequency counted once per LGA-route pair, a defined dominant-sector rule, treatment of unmatched routes, and explicit min-max scaling with equal weights. Population is expressed per **1,000** residents, as in the original plan.
