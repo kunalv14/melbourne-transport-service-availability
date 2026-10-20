@@ -3,6 +3,8 @@
 An interactive R Shiny dashboard comparing public transport service across 35 Greater Melbourne local government areas (LGAs): how much service each area has, how intense it is for the area's size, and how fair it looks per resident.
 
 **Live app:** https://pnlfx2-kunal-verma.shinyapps.io/melbourne-transport/
+**Presentation video:** https://latrobe.zoom.us/rec/share/9kcRVhV49jJtm99AIAiGo22ZN1T7AH8aEm0UYX1kZfUXndA5dzaemH6I3ESgh4Nm.4uFjL69kVJaDRt90?from=hub
+**Presentation passcode:** k=C1KBpc
 
 > The app is hosted on shinyapps.io (free plan). If it has been idle it may take a few seconds to wake up.
 
